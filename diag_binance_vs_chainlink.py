@@ -79,10 +79,11 @@ class TickCollector:
             try:
                 async with websockets.connect(
                     RTDS_URL,
-                    ping_interval=20,   # WS 协议级 ping
+                    origin="https://polymarket.com",   # 伪装成浏览器在 polymarket.com 发起的连接
+                    ping_interval=20,                  # WS 协议级 ping
                     ping_timeout=10,
                     open_timeout=10,
-                    max_size=2**20,     # 1 MB per msg，backfill 可能比较大
+                    max_size=2**20,                    # 1 MB per msg，backfill 可能比较大
                 ) as ws:
                     await ws.send(subscribe_msg)
                     self.connected = True
