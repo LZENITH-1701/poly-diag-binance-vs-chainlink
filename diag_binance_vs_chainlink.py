@@ -41,7 +41,11 @@ except ImportError:
 
 # ── 常量 ────────────────────────────────────────────────────────
 RTDS_URL                  = "wss://ws-live-data.polymarket.com"
-SYMBOL                    = "BTCUSDT"
+# Polymarket 两个 topic 用不同的 symbol 命名空间：
+#   - crypto_prices            → "BTCUSDT" (Binance 风格)
+#   - crypto_prices_chainlink  → "btc/usd" (Chainlink 风格，小写带斜杠)
+BINANCE_SYMBOL            = "BTCUSDT"
+CHAINLINK_SYMBOL          = "btc/usd"
 MOMENTUM_WINDOW_SEC       = 300    # 5 分钟
 MOMENTUM_SAMPLE_EVERY_SEC = 15     # 每 15s 采一次动量
 THRESHOLD_USD             = 60.0   # 与 strategy.py 的 momentum_threshold_usd 对齐
@@ -53,9 +57,10 @@ PING_EVERY_SEC            = 5      # per Polymarket 文档
 # TickCollector —— 一个 topic 一个连接
 # ─────────────────────────────────────────────
 class TickCollector:
-    def __init__(self, topic: str, label: str):
+    def __init__(self, topic: str, label: str, symbol: str):
         self.topic     = topic
         self.label     = label
+        self.symbol    = symbol
         # (recv_ts_unix, price, msg_type)
         self.ticks: list[tuple[float, float, str]] = []
         self.connected = False
@@ -67,7 +72,7 @@ class TickCollector:
             "subscriptions": [{
                 "topic":   self.topic,
                 "type":    "update",
-                "filters": json.dumps({"symbol": SYMBOL}),
+                "filters": json.dumps({"symbol": self.symbol}),
             }]
         })
         while not stop_event.is_set():
@@ -159,11 +164,14 @@ class TickCollector:
             return
 
         recv_now = time.time()
+        expected_sym = self.symbol.lower()
         for item in items:
             if not isinstance(item, dict):
                 continue
             sym = item.get("symbol")
-            if sym and sym != SYMBOL:
+            # Chainlink 的 payload 会带 symbol=btc/usd；Binance 的 per-item 不一定带 symbol
+            # 只在 item 明确带 symbol 且不匹配时才 reject（大小写不敏感）
+            if sym and str(sym).lower() != expected_sym:
                 continue
             val = item.get("value")
             if val is None:
@@ -380,8 +388,8 @@ def save_csvs(binance, chainlink, out_dir: Path):
 # 主协程
 # ─────────────────────────────────────────────
 async def main_async(minutes: int):
-    bn_col = TickCollector("crypto_prices",           "Bn")
-    cl_col = TickCollector("crypto_prices_chainlink", "Cl")
+    bn_col = TickCollector("crypto_prices",           "Bn", symbol=BINANCE_SYMBOL)
+    cl_col = TickCollector("crypto_prices_chainlink", "Cl", symbol=CHAINLINK_SYMBOL)
     stop_event = asyncio.Event()
 
     # 时限
@@ -418,8 +426,8 @@ async def main_async(minutes: int):
 
     print(f"收集时长: {minutes} 分钟   (Ctrl+C 可提前停止并保存)")
     print("订阅 Polymarket RTDS:")
-    print(f"  - crypto_prices           ({SYMBOL}, Binance)")
-    print(f"  - crypto_prices_chainlink ({SYMBOL}, Chainlink Data Streams)")
+    print(f"  - crypto_prices           ({BINANCE_SYMBOL}, Binance)")
+    print(f"  - crypto_prices_chainlink ({CHAINLINK_SYMBOL}, Chainlink Data Streams)")
     print()
 
     await asyncio.gather(
