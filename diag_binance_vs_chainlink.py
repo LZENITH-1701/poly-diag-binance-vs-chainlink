@@ -71,7 +71,7 @@ class TickCollector:
             "action": "subscribe",
             "subscriptions": [{
                 "topic":   self.topic,
-                "type":    "update",
+                "type":    "*",
                 "filters": json.dumps({"symbol": self.symbol}),
             }]
         })
@@ -88,11 +88,11 @@ class TickCollector:
                     self.connected = True
                     print(f"[{self.label}] ✔ connected, subscribed to {self.topic}")
 
-                    # 应用层 PING（每 5s，per 文档）
+                    # 应用层 PING（每 5s，per 文档；纯文本 "PING"，不是 JSON）
                     async def app_heartbeat():
                         while not stop_event.is_set():
                             try:
-                                await ws.send(json.dumps({"type": "ping"}))
+                                await ws.send("PING")
                             except Exception:
                                 return
                             await asyncio.sleep(PING_EVERY_SEC)
@@ -112,10 +112,13 @@ class TickCollector:
                         async for raw in ws:
                             if stop_event.is_set():
                                 break
+                            # 服务端对 "PING" 回的 "PONG" 纯文本——不算 data frame
+                            text = raw if isinstance(raw, str) else raw.decode("utf-8", errors="replace")
+                            if text == "PONG":
+                                continue
                             self.msg_count += 1
                             if self.msg_count <= 3:
-                                preview = raw if isinstance(raw, str) else raw.decode("utf-8", errors="replace")
-                                print(f"[{self.label}] raw #{self.msg_count}: {preview[:500]}", flush=True)
+                                print(f"[{self.label}] raw #{self.msg_count}: {text[:500]}", flush=True)
                             self._parse_and_store(raw)
                     finally:
                         hb_task.cancel()
