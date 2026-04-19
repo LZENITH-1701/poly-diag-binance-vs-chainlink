@@ -2,22 +2,11 @@
 analysis/diag_binance_vs_chainlink.py
 =====================================
 只读诊断 —— 同时订 Polymarket RTDS 两个 topic，被动收集数据：
-  - crypto_prices              (BTCUSDT, Binance)
-  - crypto_prices_chainlink    (BTCUSDT, Chainlink Data Streams，Polymarket 结算源)
-
-不改任何生产代码、不触碰 strategy.py / main.py / Postgres。
-跑完后输出：
-  1. 瞬时价格 basis 分布 (USD signed / USD abs / bps)
-  2. 两源 5-min 滚动动量的方向一致率
-  3. 两源 5-min 动量差值分布
-  4. $60 阈值 cross-divergence 率（**策略交易集分化率**，这是我们真正关心的指标）
-  5. 活跃度：每源的 inter-tick gap 分布
-  6. 原始 ticks CSV（analysis/diag_out/ticks_*.csv），可以之后离线再分析
+  - crypto_prices              (btcusdt, Binance)
+  - crypto_prices_chainlink    (btc/usd, Chainlink Data Streams)
 
 用法：
-  cd "<poly-s2-final>"
-  python3 analysis/diag_binance_vs_chainlink.py --minutes 30
-  python3 analysis/diag_binance_vs_chainlink.py --minutes 60
+  python3 diag_binance_vs_chainlink.py --minutes 30
 
 Ctrl+C 提前结束也会保存 + 分析现有数据。
 """
@@ -31,7 +20,6 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from statistics import median
 
 try:
     import websockets
@@ -39,443 +27,316 @@ except ImportError:
     print("缺依赖: pip install websockets", file=sys.stderr)
     sys.exit(1)
 
-# ── 常量 ────────────────────────────────────────────────────────
+# ── 常量 ──
 RTDS_URL                  = "wss://ws-live-data.polymarket.com"
-# Polymarket 两个 topic 用不同的 symbol 命名空间：
-#   - crypto_prices            → "BTCUSDT" (Binance 风格)
-#   - crypto_prices_chainlink  → "btc/usd" (Chainlink 风格，小写带斜杠)
-BINANCE_SYMBOL            = "BTCUSDT"
+BINANCE_SYMBOL            = "btcusdt"
 CHAINLINK_SYMBOL          = "btc/usd"
-MOMENTUM_WINDOW_SEC       = 300    # 5 分钟
-MOMENTUM_SAMPLE_EVERY_SEC = 15     # 每 15s 采一次动量
-THRESHOLD_USD             = 60.0   # 与 strategy.py 的 momentum_threshold_usd 对齐
-BASIS_PAIR_WINDOW_SEC     = 1.0    # 配对两源 tick 的最大时间差
-PING_EVERY_SEC            = 5      # per Polymarket 文档
+MOMENTUM_WINDOW_SEC       = 300
+MOMENTUM_SAMPLE_EVERY_SEC = 15
+THRESHOLD_USD             = 60.0
+BASIS_PAIR_WINDOW_SEC     = 1.0
+PING_EVERY_SEC            = 5
 
 
-# ─────────────────────────────────────────────
-# TickCollector —— 一个 topic 一个连接
-# ─────────────────────────────────────────────
 class TickCollector:
-    def __init__(self, topic: str, label: str, symbol: str):
-        self.topic     = topic
-        self.label     = label
-        self.symbol    = symbol
-        # (recv_ts_unix, price, msg_type)
+    def __init__(self, label: str, symbol: str, subscribe_payload: dict):
+        self.label        = label
+        self.symbol       = symbol
+        self.sub_payload  = subscribe_payload
         self.ticks: list[tuple[float, float, str]] = []
-        self.connected = False
-        self.msg_count = 0
+        self.connected    = False
+        self.msg_count    = 0
+        self.pong_count   = 0
 
     async def run(self, stop_event: asyncio.Event):
         subscribe_msg = json.dumps({
             "action": "subscribe",
-            "subscriptions": [{
-                "topic":   self.topic,
-                "type":    "*",
-                "filters": json.dumps({"symbol": self.symbol}),
-            }]
+            "subscriptions": [self.sub_payload]
         })
+
         while not stop_event.is_set():
             try:
                 async with websockets.connect(
                     RTDS_URL,
-                    origin="https://polymarket.com",   # 伪装成浏览器在 polymarket.com 发起的连接
-                    ping_interval=20,                  # WS 协议级 ping
-                    ping_timeout=10,
-                    open_timeout=10,
-                    max_size=2**20,                    # 1 MB per msg，backfill 可能比较大
+                    ping_interval=None,   # 禁用库层 ping，只用应用层
+                    ping_timeout=None,
+                    open_timeout=15,
+                    max_size=2**20,
                 ) as ws:
                     await ws.send(subscribe_msg)
                     self.connected = True
-                    print(f"[{self.label}] ✔ connected, subscribed to {self.topic}")
+                    print(f"[{self.label}] connected, sent: {subscribe_msg}")
 
-                    # 应用层 PING（每 5s，per 文档；纯文本 "PING"，不是 JSON）
-                    async def app_heartbeat():
+                    async def heartbeat():
                         while not stop_event.is_set():
+                            await asyncio.sleep(PING_EVERY_SEC)
                             try:
                                 await ws.send("PING")
                             except Exception:
                                 return
-                            await asyncio.sleep(PING_EVERY_SEC)
 
-                    # stop_event → 主动关闭 ws
-                    async def wait_and_close():
+                    async def stopper():
                         await stop_event.wait()
-                        try:
-                            await ws.close()
-                        except Exception:
-                            pass
+                        try: await ws.close()
+                        except Exception: pass
 
-                    hb_task   = asyncio.create_task(app_heartbeat())
-                    stop_task = asyncio.create_task(wait_and_close())
+                    hb = asyncio.create_task(heartbeat())
+                    st = asyncio.create_task(stopper())
 
                     try:
                         async for raw in ws:
                             if stop_event.is_set():
                                 break
-                            # 服务端对 "PING" 回的 "PONG" 纯文本——不算 data frame
                             text = raw if isinstance(raw, str) else raw.decode("utf-8", errors="replace")
                             if text == "PONG":
+                                self.pong_count += 1
                                 continue
                             self.msg_count += 1
-                            if self.msg_count <= 3:
-                                print(f"[{self.label}] raw #{self.msg_count}: {text[:500]}", flush=True)
-                            self._parse_and_store(raw)
+                            if self.msg_count <= 8:
+                                print(f"[{self.label}] msg#{self.msg_count}: {text[:800]}", flush=True)
+                            elif self.msg_count % 200 == 0:
+                                print(f"[{self.label}] msg#{self.msg_count} sample: {text[:300]}…", flush=True)
+                            self._parse(text)
                     finally:
-                        hb_task.cancel()
-                        stop_task.cancel()
+                        hb.cancel()
+                        st.cancel()
             except Exception as e:
                 self.connected = False
                 if stop_event.is_set():
                     return
-                print(f"[{self.label}] ✗ disconnected: {e}  (retry 3s)")
+                print(f"[{self.label}] disconnected: {e}  (retry 3s)")
                 await asyncio.sleep(3)
 
-    def _parse_and_store(self, raw: str):
-        """
-        防御式消息解析，兼容多种 payload 结构：
-          A)  flat:     {"symbol", "timestamp", "value"}
-          B)  wrapped:  {"type", "topic", "data": {...}}
-          C)  array:    {"type": "subscribe", "data": [{...}, {...}]}
-          D)  payload:  {"payload": {"data": [{...}, {...}]}}   ← Polymarket 实际格式
-        每条 item 的 "timestamp" (ms) 若存在则优先使用，否则 fallback 到 recv 时间。
-        """
+    def _parse(self, raw: str):
         if not raw:
             return
         try:
             msg = json.loads(raw)
         except Exception:
             return
-
         if not isinstance(msg, dict):
             return
 
-        # Unwrap Polymarket 的 "payload" 外层
-        if isinstance(msg.get("payload"), dict):
-            msg = msg["payload"]
+        msg_type = str(msg.get("type", "unknown"))
+        payload  = msg.get("payload")
 
-        msg_type = msg.get("type") or "update"
-        data     = msg.get("data")
-
-        items: list = []
-        if isinstance(data, list):
-            items = data
-        elif isinstance(data, dict):
-            items = [data]
-        elif "value" in msg or "price" in msg:
-            items = [msg]
-        else:
+        # 路径 A: live update
+        # {"topic":"…","type":"update","payload":{"symbol":"…","value":…}}
+        if isinstance(payload, dict) and "value" in payload:
+            self._store(payload, msg_type)
             return
 
+        # 路径 B: backfill batch
+        data = None
+        if isinstance(payload, dict):
+            data = payload.get("data")
+        if data is None:
+            data = msg.get("data")
+        if isinstance(data, list):
+            for item in data:
+                if isinstance(item, dict):
+                    self._store(item, msg_type)
+            return
+
+        # 路径 C: flat
+        if "value" in msg or "price" in msg:
+            self._store(msg, msg_type)
+
+    def _store(self, item: dict, msg_type: str):
         recv_now = time.time()
-        expected_sym = self.symbol.lower()
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            sym = item.get("symbol")
-            # Chainlink 的 payload 会带 symbol=btc/usd；Binance 的 per-item 不一定带 symbol
-            # 只在 item 明确带 symbol 且不匹配时才 reject（大小写不敏感）
-            if sym and str(sym).lower() != expected_sym:
-                continue
-            val = item.get("value")
-            if val is None:
-                val = item.get("price")
-            if val is None:
-                continue
-            # 用 tick 自己的 timestamp（ms）如果存在，否则 fallback 到 recv 时间
-            ts_ms = item.get("timestamp")
-            ts = recv_now
-            if ts_ms is not None:
-                try:
-                    ts = float(ts_ms) / 1000.0
-                except (ValueError, TypeError):
-                    pass
+        expected = self.symbol.lower()
+        sym = item.get("symbol")
+        if sym and str(sym).lower() != expected:
+            return
+        val = item.get("value")
+        if val is None:
+            val = item.get("price")
+        if val is None:
+            return
+        ts_ms = item.get("timestamp")
+        ts = recv_now
+        if ts_ms is not None:
             try:
-                self.ticks.append((ts, float(val), msg_type))
+                ts = float(ts_ms) / 1000.0
             except (ValueError, TypeError):
-                continue
+                pass
+        try:
+            self.ticks.append((ts, float(val), msg_type))
+        except (ValueError, TypeError):
+            pass
 
 
-# ─────────────────────────────────────────────
-# 分析器
-# ─────────────────────────────────────────────
-def _pct(sorted_list, p: float):
-    if not sorted_list:
-        return float("nan")
-    n = len(sorted_list)
-    i = min(n - 1, max(0, int(p * n)))
-    return sorted_list[i]
+# ── 分析 ──
+def _pct(s, p):
+    if not s: return float("nan")
+    return s[min(len(s)-1, max(0, int(p*len(s))))]
 
 
-def analyze(binance: list, chainlink: list):
-    print()
-    print("=" * 78)
+def analyze(binance, chainlink):
+    print("\n" + "="*78)
     print("诊断报告")
-    print("=" * 78)
+    print("="*78)
 
-    bn_all_updates = sum(1 for _, _, t in binance   if t == "update")
-    cl_all_updates = sum(1 for _, _, t in chainlink if t == "update")
-    print(f"Binance   收到 ticks: {len(binance):>6}   (update={bn_all_updates})")
-    print(f"Chainlink 收到 ticks: {len(chainlink):>6}   (update={cl_all_updates})")
+    def tcnt(ticks):
+        d = {}
+        for _,_,t in ticks:
+            d[t] = d.get(t,0)+1
+        return d
 
-    # 只用 update tick（排除 subscribe 时的 backfill，时间戳是 recv 而非实际）
-    bn = sorted([(ts, v) for ts, v, typ in binance   if typ == "update"])
-    cl = sorted([(ts, v) for ts, v, typ in chainlink if typ == "update"])
+    print(f"Binance   总ticks: {len(binance):>6}  分布: {tcnt(binance)}")
+    print(f"Chainlink 总ticks: {len(chainlink):>6}  分布: {tcnt(chainlink)}")
 
-    if len(bn) < 10 or len(cl) < 10:
-        print()
-        print("!! 数据太少（任一源 update tick < 10），分析中止")
-        return
+    bn_live = [(ts,v) for ts,v,t in binance   if t == "update"]
+    cl_live = [(ts,v) for ts,v,t in chainlink if t == "update"]
 
-    dur_bn = bn[-1][0] - bn[0][0]
-    dur_cl = cl[-1][0] - cl[0][0]
-    print()
-    print(f"Binance   活跃时长: {dur_bn:>7.1f}s   平均 {len(bn)/dur_bn:>5.2f} ticks/s")
-    print(f"Chainlink 活跃时长: {dur_cl:>7.1f}s   平均 {len(cl)/dur_cl:>5.2f} ticks/s")
+    if len(bn_live) < 10 or len(cl_live) < 10:
+        print(f"\n  ⚠ update tick 不足 (Bn={len(bn_live)}, Cl={len(cl_live)})")
+        print("  fallback: 用全部 ticks…")
+        bn_live = [(ts,v) for ts,v,_ in binance]
+        cl_live = [(ts,v) for ts,v,_ in chainlink]
 
-    # ─────────────────────────────────────────────
-    # 活跃度：inter-tick gap
-    # ─────────────────────────────────────────────
-    bn_gaps = sorted(bn[i+1][0] - bn[i][0] for i in range(len(bn) - 1))
-    cl_gaps = sorted(cl[i+1][0] - cl[i][0] for i in range(len(cl) - 1))
-    print()
-    print("─── 活跃度 (tick-to-tick 间隔) ───")
-    print(f"  Binance    gap  p50={_pct(bn_gaps, .50):.3f}s  p95={_pct(bn_gaps, .95):.3f}s  max={bn_gaps[-1]:.3f}s")
-    print(f"  Chainlink  gap  p50={_pct(cl_gaps, .50):.3f}s  p95={_pct(cl_gaps, .95):.3f}s  max={cl_gaps[-1]:.3f}s")
+    if len(bn_live) < 10 or len(cl_live) < 10:
+        print("  !! 数据太少，中止"); return
 
-    # ─────────────────────────────────────────────
-    # 1) 瞬时价格 basis
-    # ─────────────────────────────────────────────
-    print()
-    print(f"─── 1. 瞬时价格 basis  (Chainlink − Binance, 配对窗口 ±{BASIS_PAIR_WINDOW_SEC}s) ───")
-    bn_ts   = [t for t, _ in bn]
-    bn_vals = [v for _, v in bn]
+    bn = sorted(bn_live); cl = sorted(cl_live)
+    dur_bn = bn[-1][0]-bn[0][0]; dur_cl = cl[-1][0]-cl[0][0]
+    print(f"\nBn 时长: {dur_bn:.1f}s  {len(bn)/max(dur_bn,.01):.2f} t/s")
+    print(f"Cl 时长: {dur_cl:.1f}s  {len(cl)/max(dur_cl,.01):.2f} t/s")
 
-    diffs: list[float] = []   # signed (CL - BN)
-    for cts, cv in cl:
-        i = bisect.bisect_left(bn_ts, cts)
-        best, best_dt = None, 1e9
-        for c in (i, i - 1):
-            if 0 <= c < len(bn_ts):
-                dt = abs(bn_ts[c] - cts)
-                if dt < best_dt:
-                    best, best_dt = c, dt
-        if best is not None and best_dt <= BASIS_PAIR_WINDOW_SEC:
-            diffs.append(cv - bn_vals[best])
+    bg = sorted(bn[i+1][0]-bn[i][0] for i in range(len(bn)-1))
+    cg = sorted(cl[i+1][0]-cl[i][0] for i in range(len(cl)-1))
+    print("\n─── 活跃度 ───")
+    print(f"  Bn gap p50={_pct(bg,.5):.3f}s p95={_pct(bg,.95):.3f}s max={bg[-1]:.3f}s")
+    print(f"  Cl gap p50={_pct(cg,.5):.3f}s p95={_pct(cg,.95):.3f}s max={cg[-1]:.3f}s")
+
+    print(f"\n─── 1. basis (CL−BN, ±{BASIS_PAIR_WINDOW_SEC}s) ───")
+    bts=[t for t,_ in bn]; bv=[v for _,v in bn]
+    diffs=[]
+    for cts,cv in cl:
+        i=bisect.bisect_left(bts,cts); best=None; bdt=1e9
+        for c in (i,i-1):
+            if 0<=c<len(bts):
+                dt=abs(bts[c]-cts)
+                if dt<bdt: best,bdt=c,dt
+        if best is not None and bdt<=BASIS_PAIR_WINDOW_SEC:
+            diffs.append(cv-bv[best])
 
     if not diffs:
-        print("  !! 配对失败（时间不对齐）")
+        print("  !! 配对失败")
     else:
-        signed = sorted(diffs)
-        absd   = sorted(abs(x) for x in diffs)
-        n      = len(signed)
-        mid_bn = sum(bn_vals) / len(bn_vals)
-        bps    = sorted(abs(x) / mid_bn * 10000 for x in diffs)
-        print(f"  配对样本: {n}")
-        print(f"  basis USD  signed : p05={_pct(signed,.05):+8.3f}  p50={_pct(signed,.50):+8.3f}  p95={_pct(signed,.95):+8.3f}  min={signed[0]:+8.3f}  max={signed[-1]:+8.3f}")
-        print(f"  basis USD  |abs|  : p50={_pct(absd,.50):8.3f}  p95={_pct(absd,.95):8.3f}  p99={_pct(absd,.99):8.3f}  max={absd[-1]:8.3f}")
-        print(f"  basis bps  |abs|  : p50={_pct(bps,.50):8.2f}  p95={_pct(bps,.95):8.2f}  p99={_pct(bps,.99):8.2f}  max={bps[-1]:8.2f}")
-        # 有向性检查：是否存在持续偏置
-        mean_signed = sum(signed) / n
-        print(f"  basis 均值 (bias) : {mean_signed:+.3f} USD   (>0 → Chainlink 系统性高于 Binance)")
+        sd=sorted(diffs); ab=sorted(abs(x) for x in diffs)
+        mid=sum(bv)/len(bv); bp=sorted(abs(x)/mid*10000 for x in diffs)
+        print(f"  样本: {len(diffs)}")
+        print(f"  signed: p05={_pct(sd,.05):+.3f} p50={_pct(sd,.5):+.3f} p95={_pct(sd,.95):+.3f}")
+        print(f"  |abs|:  p50={_pct(ab,.5):.3f} p95={_pct(ab,.95):.3f} max={ab[-1]:.3f}")
+        print(f"  bps:    p50={_pct(bp,.5):.2f} p95={_pct(bp,.95):.2f} max={bp[-1]:.2f}")
+        print(f"  bias:   {sum(diffs)/len(diffs):+.3f} USD")
 
-    # ─────────────────────────────────────────────
-    # 2) 5-min 滚动动量
-    # ─────────────────────────────────────────────
-    print()
-    print(f"─── 2. 5-min 滚动动量  (窗口={MOMENTUM_WINDOW_SEC}s, 每 {MOMENTUM_SAMPLE_EVERY_SEC}s 采样) ───")
+    print(f"\n─── 2. 5min动量 ───")
+    t0=max(bn[0][0],cl[0][0])+MOMENTUM_WINDOW_SEC
+    te=min(bn[-1][0],cl[-1][0])
+    if te<=t0: print("  (不足5min)"); return
 
-    t_start = max(bn[0][0], cl[0][0]) + MOMENTUM_WINDOW_SEC
-    t_end   = min(bn[-1][0], cl[-1][0])
-    if t_end <= t_start:
-        print("  (数据时长不足 5 分钟，无法计算动量)")
-        return
+    def pat(tk,t):
+        ts=[x[0] for x in tk]; i=bisect.bisect_right(ts,t)-1
+        return tk[i][1] if i>=0 else None
 
-    def price_at(ticks: list, t: float):
-        """返回 ≤ t 的最近一笔价格；找不到返回 None。"""
-        ts_list = [x[0] for x in ticks]
-        i = bisect.bisect_right(ts_list, t) - 1
-        if i < 0:
-            return None
-        return ticks[i][1]
+    mps=[]
+    t=t0
+    while t<=te:
+        a,b,c,d=pat(bn,t),pat(bn,t-MOMENTUM_WINDOW_SEC),pat(cl,t),pat(cl,t-MOMENTUM_WINDOW_SEC)
+        if None not in (a,b,c,d): mps.append((t,a-b,c-d))
+        t+=MOMENTUM_SAMPLE_EVERY_SEC
 
-    mom_pairs: list[tuple[float, float, float]] = []   # (t, bn_mom, cl_mom)
-    t = t_start
-    while t <= t_end:
-        a = price_at(bn, t)
-        b = price_at(bn, t - MOMENTUM_WINDOW_SEC)
-        c = price_at(cl, t)
-        d = price_at(cl, t - MOMENTUM_WINDOW_SEC)
-        if None not in (a, b, c, d):
-            mom_pairs.append((t, a - b, c - d))
-        t += MOMENTUM_SAMPLE_EVERY_SEC
+    if not mps: print("  (空)"); return
+    ss=sum(1 for _,bm,cm in mps if (bm>=0)==(cm>=0))
+    md=sorted(abs(bm-cm) for _,bm,cm in mps)
+    print(f"  采样: {len(mps)}")
+    print(f"  方向一致: {ss}/{len(mps)} = {ss/len(mps)*100:.1f}%")
+    print(f"  |diff|: p50={_pct(md,.5):.2f} p95={_pct(md,.95):.2f} max={md[-1]:.2f}")
 
-    if not mom_pairs:
-        print("  (动量配对为空)")
-        return
+    print(f"\n─── 3. ${THRESHOLD_USD:.0f} 分化 ★ ───")
+    bpp=[abs(bm)>=THRESHOLD_USD for _,bm,_ in mps]
+    cpp=[abs(cm)>=THRESHOLD_USD for _,_,cm in mps]
+    bb=sum(b and c for b,c in zip(bpp,cpp))
+    nn=sum(not b and not c for b,c in zip(bpp,cpp))
+    ob=sum(b and not c for b,c in zip(bpp,cpp))
+    oc=sum(not b and c for b,c in zip(bpp,cpp))
+    n=len(bpp)
+    print(f"  都做: {bb}/{n}={bb/n*100:.1f}%  都不做: {nn}/{n}={nn/n*100:.1f}%")
+    print(f"  仅Bn: {ob}/{n}={ob/n*100:.1f}%  仅Cl: {oc}/{n}={oc/n*100:.1f}%")
+    print(f"  分化: {ob+oc}/{n}={(ob+oc)/n*100:.1f}%")
+    dd=sum(1 for _,bm,cm in mps if abs(bm)>=THRESHOLD_USD and abs(cm)>=THRESHOLD_USD and (bm>0)!=(cm>0))
+    print(f"  方向冲突: {dd}/{n}={dd/n*100:.2f}%")
 
-    same_sign = sum(
-        1 for _, bm, cm in mom_pairs
-        if (bm >= 0 and cm >= 0) or (bm < 0 and cm < 0)
-    )
-    mom_diffs_abs = sorted(abs(bm - cm) for _, bm, cm in mom_pairs)
-    n = len(mom_pairs)
-    print(f"  动量采样数: {n}")
-    print(f"  方向一致率: {same_sign}/{n} = {same_sign/n*100:.2f}%")
-    print(f"  |Bn_mom − Cl_mom| USD : "
-          f"p50={_pct(mom_diffs_abs,.50):6.2f}  "
-          f"p95={_pct(mom_diffs_abs,.95):6.2f}  "
-          f"p99={_pct(mom_diffs_abs,.99):6.2f}  "
-          f"max={mom_diffs_abs[-1]:6.2f}")
-
-    # ─────────────────────────────────────────────
-    # 3) 阈值 cross-divergence（策略行为分化）
-    # ─────────────────────────────────────────────
-    print()
-    print(f"─── 3. 阈值 ${THRESHOLD_USD:.0f} cross-divergence  ★ 策略交易集分化率 ★ ───")
-    bn_pass = [abs(bm) >= THRESHOLD_USD for _, bm, _  in mom_pairs]
-    cl_pass = [abs(cm) >= THRESHOLD_USD for _, _,  cm in mom_pairs]
-    both_pass = sum(1 for b, c in zip(bn_pass, cl_pass) if     b and     c)
-    both_fail = sum(1 for b, c in zip(bn_pass, cl_pass) if not b and not c)
-    only_bn   = sum(1 for b, c in zip(bn_pass, cl_pass) if     b and not c)
-    only_cl   = sum(1 for b, c in zip(bn_pass, cl_pass) if not b and     c)
-    total = len(bn_pass)
-    print(f"  两源都过阈值 (都交易)    : {both_pass:>5}/{total} = {both_pass/total*100:6.2f}%")
-    print(f"  两源都未过   (都不交易)  : {both_fail:>5}/{total} = {both_fail/total*100:6.2f}%")
-    print(f"  仅 Binance   过  (旧会做) : {only_bn:>5}/{total} = {only_bn/total*100:6.2f}%   ← 切换后不再做")
-    print(f"  仅 Chainlink 过  (新会做) : {only_cl:>5}/{total} = {only_cl/total*100:6.2f}%   ← 切换后新增做")
-    print(f"  合计分化率               : {(only_bn+only_cl):>5}/{total} = {(only_bn+only_cl)/total*100:6.2f}%")
-
-    # 方向分化（更极端：一侧说 Up 要做，一侧说 Down 要做，虽然罕见）
-    dir_diverge = sum(
-        1 for _, bm, cm in mom_pairs
-        if abs(bm) >= THRESHOLD_USD and abs(cm) >= THRESHOLD_USD
-        and ((bm > 0) != (cm > 0))
-    )
-    print(f"  **方向相反且都过阈值**   : {dir_diverge:>5}/{total} = {dir_diverge/total*100:6.2f}%   (最危险场景)")
-
-    # ─────────────────────────────────────────────
-    # 结论提示
-    # ─────────────────────────────────────────────
-    print()
-    print("─── 如何解读 ───")
-    total_div = (only_bn + only_cl) / total * 100
-    if total_div < 1.0 and dir_diverge == 0:
-        print("  ✅ 分化率 < 1% 且无方向冲突 → Option A（只换价格，保留 Binance 动量）足够安全")
-    elif total_div < 5.0:
-        print(f"  ⚠️  分化率 {total_div:.1f}% → Option A 可行但会略损失一致性，建议观察实际 PnL")
-    else:
-        print(f"  ❌ 分化率 {total_div:.1f}% → 必须 Option B（连动量一起切换到 Chainlink）")
+    td=(ob+oc)/n*100
+    print("\n─── 结论 ───")
+    if td<1 and dd==0: print("  ✅ 安全切换")
+    elif td<5: print(f"  ⚠️  分化{td:.1f}%, 可切换但关注PnL")
+    else: print(f"  ❌ 分化{td:.1f}%, 必须连动量一起切")
 
 
-# ─────────────────────────────────────────────
-# 原始 CSV 落盘
-# ─────────────────────────────────────────────
-def save_csvs(binance, chainlink, out_dir: Path):
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%SZ")
+def save_csvs(binance, chainlink, out_dir):
+    stamp=datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%SZ")
     out_dir.mkdir(parents=True, exist_ok=True)
-    paths = []
-    for name, data in [("binance", binance), ("chainlink", chainlink)]:
-        path = out_dir / f"ticks_{name}_{stamp}.csv"
-        with open(path, "w", newline="", encoding="utf-8") as fp:
-            w = csv.writer(fp)
-            w.writerow(["recv_ts_unix", "price", "msg_type"])
-            w.writerows(data)
-        paths.append(path)
-    print()
-    print("─── 原始数据 ───")
-    for p in paths:
-        print(f"  已保存: {p}")
-
-    # 同时把 CSV 内容打到 stdout，方便 `| tee` 在本地保存
-    # （Heroku one-off dyno 的文件系统是 ephemeral，dyno 销毁后 /app/diag_out/ 也没了）
-    for p in paths:
-        print()
-        print(f"─── BEGIN CSV: {p.name} ───")
-        try:
-            with open(p, "r", encoding="utf-8") as fp:
-                sys.stdout.write(fp.read())
-        except Exception as e:
-            print(f"!! 读取 CSV 失败: {e}")
-        sys.stdout.flush()
-        print(f"─── END CSV: {p.name} ───")
+    for name,data in [("binance",binance),("chainlink",chainlink)]:
+        p=out_dir/f"ticks_{name}_{stamp}.csv"
+        with open(p,"w",newline="",encoding="utf-8") as fp:
+            w=csv.writer(fp); w.writerow(["tick_ts","price","type"]); w.writerows(data)
+        print(f"  saved: {p}")
+        print(f"\n─── BEGIN {p.name} ───")
+        with open(p,encoding="utf-8") as fp: sys.stdout.write(fp.read())
+        print(f"─── END {p.name} ───")
 
 
-# ─────────────────────────────────────────────
-# 主协程
-# ─────────────────────────────────────────────
-async def main_async(minutes: int):
-    bn_col = TickCollector("crypto_prices",           "Bn", symbol=BINANCE_SYMBOL)
-    cl_col = TickCollector("crypto_prices_chainlink", "Cl", symbol=CHAINLINK_SYMBOL)
-    stop_event = asyncio.Event()
+async def main_async(minutes):
+    # ★ 完全按 Polymarket 文档格式 ★
+    # Binance:   type=update, 不传 filters
+    # Chainlink: type=*, filters=""
+    bn_sub = {"topic": "crypto_prices", "type": "update"}
+    cl_sub = {"topic": "crypto_prices_chainlink", "type": "*", "filters": ""}
 
-    # 时限
+    bn = TickCollector("Bn", BINANCE_SYMBOL, bn_sub)
+    cl = TickCollector("Cl", CHAINLINK_SYMBOL, cl_sub)
+    stop = asyncio.Event()
+
     async def timer():
-        try:
-            await asyncio.wait_for(stop_event.wait(), timeout=minutes * 60)
+        try: await asyncio.wait_for(stop.wait(), timeout=minutes*60)
         except asyncio.TimeoutError:
-            print(f"\n[timer] {minutes} 分钟时限到，收尾…")
-            stop_event.set()
+            print(f"\n[timer] {minutes}min done"); stop.set()
 
-    # 进度条
     async def progress():
-        while not stop_event.is_set():
-            try:
-                await asyncio.wait_for(stop_event.wait(), timeout=30)
-            except asyncio.TimeoutError:
-                pass
-            print(f"  [progress] Bn ticks={len(bn_col.ticks):>5} msgs={bn_col.msg_count:>5} (conn={bn_col.connected})   "
-                  f"Cl ticks={len(cl_col.ticks):>5} msgs={cl_col.msg_count:>5} (conn={cl_col.connected})", flush=True)
+        while not stop.is_set():
+            try: await asyncio.wait_for(stop.wait(), timeout=15)
+            except asyncio.TimeoutError: pass
+            bu=sum(1 for _,_,t in bn.ticks if t=="update")
+            cu=sum(1 for _,_,t in cl.ticks if t=="update")
+            print(f"  [prog] Bn: tot={len(bn.ticks)} live={bu} msg={bn.msg_count} pong={bn.pong_count}  "
+                  f"Cl: tot={len(cl.ticks)} live={cu} msg={cl.msg_count} pong={cl.pong_count}", flush=True)
 
-    # Ctrl+C: asyncio signal handler（比 signal.signal 和 loop 集成得更干净）
-    loop = asyncio.get_running_loop()
+    loop=asyncio.get_running_loop()
+    def onsig():
+        print("\n[sig] stopping…"); stop.set()
+    for s in (signal.SIGINT,signal.SIGTERM):
+        try: loop.add_signal_handler(s,onsig)
+        except NotImplementedError: signal.signal(s, lambda *_: stop.set())
 
-    def on_signal():
-        print("\n[sig] 收到中断，保存并分析现有数据…")
-        stop_event.set()
+    print(f"收集 {minutes}min  (Ctrl+C 提前停)")
+    print(f"  Bn: {json.dumps(bn_sub)}")
+    print(f"  Cl: {json.dumps(cl_sub)}\n")
 
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        try:
-            loop.add_signal_handler(sig, on_signal)
-        except NotImplementedError:
-            # Windows 不支持；fallback 到 signal.signal
-            signal.signal(sig, lambda *_: stop_event.set())
-
-    print(f"收集时长: {minutes} 分钟   (Ctrl+C 可提前停止并保存)")
-    print("订阅 Polymarket RTDS:")
-    print(f"  - crypto_prices           ({BINANCE_SYMBOL}, Binance)")
-    print(f"  - crypto_prices_chainlink ({CHAINLINK_SYMBOL}, Chainlink Data Streams)")
-    print()
-
-    await asyncio.gather(
-        bn_col.run(stop_event),
-        cl_col.run(stop_event),
-        timer(),
-        progress(),
-        return_exceptions=True,
-    )
-
-    # 落盘 + 分析
-    out_dir = Path(__file__).parent / "diag_out"
-    save_csvs(bn_col.ticks, cl_col.ticks, out_dir)
-    analyze(bn_col.ticks, cl_col.ticks)
+    await asyncio.gather(bn.run(stop),cl.run(stop),timer(),progress(),return_exceptions=True)
+    out=Path(__file__).parent/"diag_out"
+    save_csvs(bn.ticks,cl.ticks,out)
+    analyze(bn.ticks,cl.ticks)
 
 
 def main():
-    ap = argparse.ArgumentParser(description=__doc__.strip().split("\n")[0])
-    ap.add_argument("--minutes", type=int, default=30,
-                    help="收集时长（分钟），默认 30，推荐 30~60")
-    args = ap.parse_args()
+    ap=argparse.ArgumentParser()
+    ap.add_argument("--minutes",type=int,default=30)
+    a=ap.parse_args()
+    if a.minutes<6: print("!! >=6min",file=sys.stderr); sys.exit(1)
+    try: asyncio.run(main_async(a.minutes))
+    except KeyboardInterrupt: pass
 
-    if args.minutes < 6:
-        print("!! --minutes 至少 6（动量窗口是 5 分钟）", file=sys.stderr)
-        sys.exit(1)
-
-    try:
-        asyncio.run(main_async(args.minutes))
-    except KeyboardInterrupt:
-        pass
-
-
-if __name__ == "__main__":
-    main()
+if __name__=="__main__": main()
