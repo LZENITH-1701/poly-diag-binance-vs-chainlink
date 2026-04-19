@@ -124,12 +124,15 @@ class TickCollector:
 
     def _parse_and_store(self, raw: str):
         """
-        防御式消息解析：Polymarket RTDS 的具体 payload 结构文档没写死，
-        这里兼容三种可能形状：
-          A)  flat:    {"symbol", "timestamp", "value"}
-          B)  wrapped: {"type", "topic", "data": {"symbol", "timestamp", "value"}}
-          C)  array:   {"type": "subscribe", "data": [{...}, {...}]}   (backfill)
+        防御式消息解析，兼容多种 payload 结构：
+          A)  flat:     {"symbol", "timestamp", "value"}
+          B)  wrapped:  {"type", "topic", "data": {...}}
+          C)  array:    {"type": "subscribe", "data": [{...}, {...}]}
+          D)  payload:  {"payload": {"data": [{...}, {...}]}}   ← Polymarket 实际格式
+        每条 item 的 "timestamp" (ms) 若存在则优先使用，否则 fallback 到 recv 时间。
         """
+        if not raw:
+            return
         try:
             msg = json.loads(raw)
         except Exception:
@@ -137,6 +140,10 @@ class TickCollector:
 
         if not isinstance(msg, dict):
             return
+
+        # Unwrap Polymarket 的 "payload" 外层
+        if isinstance(msg.get("payload"), dict):
+            msg = msg["payload"]
 
         msg_type = msg.get("type") or "update"
         data     = msg.get("data")
@@ -151,7 +158,7 @@ class TickCollector:
         else:
             return
 
-        now = time.time()
+        recv_now = time.time()
         for item in items:
             if not isinstance(item, dict):
                 continue
@@ -163,8 +170,16 @@ class TickCollector:
                 val = item.get("price")
             if val is None:
                 continue
+            # 用 tick 自己的 timestamp（ms）如果存在，否则 fallback 到 recv 时间
+            ts_ms = item.get("timestamp")
+            ts = recv_now
+            if ts_ms is not None:
+                try:
+                    ts = float(ts_ms) / 1000.0
+                except (ValueError, TypeError):
+                    pass
             try:
-                self.ticks.append((now, float(val), msg_type))
+                self.ticks.append((ts, float(val), msg_type))
             except (ValueError, TypeError):
                 continue
 
