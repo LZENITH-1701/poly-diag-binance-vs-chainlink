@@ -383,6 +383,19 @@ def save_csvs(binance, chainlink, out_dir: Path):
     for p in paths:
         print(f"  已保存: {p}")
 
+    # 同时把 CSV 内容打到 stdout，方便 `| tee` 在本地保存
+    # （Heroku one-off dyno 的文件系统是 ephemeral，dyno 销毁后 /app/diag_out/ 也没了）
+    for p in paths:
+        print()
+        print(f"─── BEGIN CSV: {p.name} ───")
+        try:
+            with open(p, "r", encoding="utf-8") as fp:
+                sys.stdout.write(fp.read())
+        except Exception as e:
+            print(f"!! 读取 CSV 失败: {e}")
+        sys.stdout.flush()
+        print(f"─── END CSV: {p.name} ───")
+
 
 # ─────────────────────────────────────────────
 # 主协程
