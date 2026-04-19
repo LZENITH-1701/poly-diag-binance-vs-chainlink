@@ -63,6 +63,7 @@ class TickCollector:
 
     async def run(self, stop_event: asyncio.Event):
         subscribe_msg = json.dumps({
+            "action": "subscribe",
             "subscriptions": [{
                 "topic":   self.topic,
                 "type":    "update",
@@ -107,6 +108,9 @@ class TickCollector:
                             if stop_event.is_set():
                                 break
                             self.msg_count += 1
+                            if self.msg_count <= 3:
+                                preview = raw if isinstance(raw, str) else raw.decode("utf-8", errors="replace")
+                                print(f"[{self.label}] raw #{self.msg_count}: {preview[:500]}", flush=True)
                             self._parse_and_store(raw)
                     finally:
                         hb_task.cancel()
@@ -380,8 +384,8 @@ async def main_async(minutes: int):
                 await asyncio.wait_for(stop_event.wait(), timeout=30)
             except asyncio.TimeoutError:
                 pass
-            print(f"  [progress] Bn ticks={len(bn_col.ticks):>5} (conn={bn_col.connected})   "
-                  f"Cl ticks={len(cl_col.ticks):>5} (conn={cl_col.connected})")
+            print(f"  [progress] Bn ticks={len(bn_col.ticks):>5} msgs={bn_col.msg_count:>5} (conn={bn_col.connected})   "
+                  f"Cl ticks={len(cl_col.ticks):>5} msgs={cl_col.msg_count:>5} (conn={cl_col.connected})", flush=True)
 
     # Ctrl+C: asyncio signal handler（比 signal.signal 和 loop 集成得更干净）
     loop = asyncio.get_running_loop()
