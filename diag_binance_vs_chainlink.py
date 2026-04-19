@@ -477,7 +477,8 @@ async def main_async(minutes: int):
     print(f"收集时长: {minutes} 分钟   (Ctrl+C 可提前停止并保存)")
     print("订阅 Polymarket RTDS:")
     print(f"  - crypto_prices           ({BINANCE_SYMBOL})  type='update', filters='{BINANCE_SYMBOL}'")
-    print(f"  - crypto_prices_chainlink ({CHAINLINK_SYMBOL})  type='*', filters='{json.dumps({\"symbol\": CHAINLINK_SYMBOL})}'")
+    cl_filters_str = json.dumps({"symbol": CHAINLINK_SYMBOL})
+    print(f"  - crypto_prices_chainlink ({CHAINLINK_SYMBOL})  type='*', filters='{cl_filters_str}'")
     print()
 
     await asyncio.gather(
